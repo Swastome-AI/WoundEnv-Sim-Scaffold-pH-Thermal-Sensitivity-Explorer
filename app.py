@@ -3,323 +3,328 @@ import numpy as np
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
+import uuid
 
-# --- PAGE CONFIGURATION ---
 st.set_page_config(
-    page_title="WoundEnv Sim | pH & Thermal Sensitivity",
-    page_icon="🌡️",
+    page_title="WoundEnv Sim | Dynamic pH & Thermal Simulator",
+    page_icon="🧪",
     layout="wide"
 )
 
-st.title("🌡️ WoundEnv Sim: Scaffold pH & Thermal Sensitivity Explorer")
-st.markdown(
-    "Interactive simulation comparing **Formulation A (Collagen + Chitosan Control)** vs. "
-    "**Formulation B (Collagen + Hyaluronic Acid + Chitosan)** across wound bed pH and temperature regimes."
-)
+st.title("🧪 WoundEnv Sim: Dynamic Scaffold pH & Thermal Simulator")
+st.markdown("Build your own custom formulations, choose your concentrations, and test any pH and temperature points.")
 
-# --- SIDEBAR: PDB UPLOAD & CONCENTRATION CONTROLS ---
-st.sidebar.header("1. Structure & Recipe Inputs")
-uploaded_ha = st.sidebar.file_uploader(
-    "Upload GLYCAM Hyaluronic Acid PDB (.pdb) [Optional]", type=["pdb"]
-)
+# --- SESSION STATE INITIALIZATION ---
+if "molecules" not in st.session_state:
+    st.session_state.molecules = {
+        "Collagen": {"mw": 8200.0, "acid_groups": 6.0, "pKa_acid": 4.1, "base_groups": 6.0, "pKa_base": 10.5, "hydro_factor": 1.0},
+        "Chitosan": {"mw": 1650.0, "acid_groups": 0.0, "pKa_acid": 0.0, "base_groups": 8.5, "pKa_base": 6.5, "hydro_factor": 1.15},
+        "Hyaluronic Acid": {"mw": 1155.9, "acid_groups": 3.0, "pKa_acid": 3.2, "base_groups": 0.0, "pKa_base": 0.0, "hydro_factor": 1.50},
+        "PCL (Polycaprolactone)": {"mw": 588.0, "acid_groups": 0.0, "pKa_acid": 0.0, "base_groups": 0.0, "pKa_base": 0.0, "hydro_factor": 0.55},
+    }
 
-st.sidebar.subheader("Polymer Concentrations (% w/v)")
-conc_col = st.sidebar.slider("Collagen (% w/v)", 0.1, 5.0, 1.0, 0.1)
-conc_chi = st.sidebar.slider("Chitosan (% w/v)", 0.1, 5.0, 1.0, 0.1)
-conc_ha = st.sidebar.slider("Hyaluronic Acid (% w/v) [Formulation B]", 0.1, 5.0, 1.0, 0.1)
-film_thickness = st.sidebar.number_input("Film Thickness (mm)", 0.05, 5.0, 0.5, 0.05)
+if "conditions" not in st.session_state:
+    st.session_state.conditions = {}
 
-st.sidebar.divider()
-st.sidebar.header("2. Wound Bed Presets")
-wound_preset = st.sidebar.radio(
-    "Select Clinical Scenario",
-    [
-        "Healthy / Healing Skin (pH 5.5, 36.5 °C)",
-        "Physiological / Lab PBS (pH 7.4, 37.0 °C)",
-        "Infected / Inflamed Wound (pH 8.5, 39.5 °C)",
-        "Room Temp Storage / Prep (pH 7.0, 25.0 °C)",
-        "Custom Slider Values"
-    ],
-    index=1
-)
-
-preset_map = {
-    "Healthy / Healing Skin (pH 5.5, 36.5 °C)": (5.5, 36.5),
-    "Physiological / Lab PBS (pH 7.4, 37.0 °C)": (7.4, 37.0),
-    "Infected / Inflamed Wound (pH 8.5, 39.5 °C)": (8.5, 39.5),
-    "Room Temp Storage / Prep (pH 7.0, 25.0 °C)": (7.0, 25.0),
-}
-
-if wound_preset in preset_map:
-    default_ph, default_temp = preset_map[wound_preset]
-else:
-    default_ph, default_temp = 7.4, 37.0
-
-# --- PARSE GLYCAM HA PDB ---
-def parse_glycam_ha(raw_bytes):
+# --- HELPER: PARSE OPTIONAL PDB UPLOAD ---
+def parse_pdb_for_ha(raw_bytes):
     residues = {}
-    atom_count = 0
     for line in raw_bytes.decode("utf-8", errors="replace").splitlines():
         if line.startswith("ATOM"):
-            atom_count += 1
             atom_name = line[12:16].strip()
             res_name = line[17:20].strip()
             res_seq = int(line[22:26].strip())
             residues.setdefault(res_seq, {"res_name": res_name, "atoms": []})
             residues[res_seq]["atoms"].append(atom_name)
-
-    carboxyls = sum(
-        1 for r in residues.values() if "O6A" in r["atoms"] and "O6B" in r["atoms"]
-    )
+    carboxyls = sum(1 for r in residues.values() if "O6A" in r["atoms"] and "O6B" in r["atoms"])
     n_glca = sum(1 for r in residues.values() if "ZB" in r["res_name"])
     n_glcnac = sum(1 for r in residues.values() if "YB" in r["res_name"])
     mw = (n_glca * 176.12) + (n_glcnac * 203.19) + 18.02
-    return {
-        "atoms": atom_count,
-        "residues": len(residues),
-        "carboxyls": max(carboxyls, 1),
-        "mw": mw if mw > 50 else 1156.0,
-        "source": "Uploaded GLYCAM PDB"
-    }
+    if mw > 50 and carboxyls > 0:
+        st.session_state.molecules["Hyaluronic Acid"]["mw"] = mw
+        st.session_state.molecules["Hyaluronic Acid"]["acid_groups"] = float(carboxyls)
+        return True, mw, carboxyls
+    return False, 0, 0
 
-if uploaded_ha is not None:
-    ha_data = parse_glycam_ha(uploaded_ha.getvalue())
-    st.sidebar.success(
-        f"Loaded HA PDB: {ha_data['residues']} residues, {ha_data['carboxyls']} -COO⁻ groups ({ha_data['mw']:.1f} Da)"
-    )
+# --- SIDEBAR: OPTIONAL PDB & CUSTOM MOLECULES ---
+with st.sidebar:
+    st.header("1. Molecule Library")
+    upl = st.file_uploader("Upload GLYCAM HA PDB (optional)", type=["pdb"])
+    if upl is not None:
+        ok, mw, carb = parse_pdb_for_ha(upl.getvalue())
+        if ok:
+            st.success(f"Updated HA from PDB: {mw:.1f} Da, {carb} carboxyl groups")
+
+    with st.expander("➕ Add Custom Molecule"):
+        m_name = st.text_input("Molecule Name", placeholder="e.g., Alginate")
+        m_mw = st.number_input("Molecular Weight (Da)", 50.0, 500000.0, 2000.0)
+        m_acid = st.number_input("Acidic Groups per Chain (-COOH)", 0.0, 100.0, 0.0)
+        m_pka_a = st.number_input("Acidic pKa", 1.0, 14.0, 3.5)
+        m_base = st.number_input("Basic Groups per Chain (-NH2)", 0.0, 100.0, 0.0)
+        m_pka_b = st.number_input("Basic pKa", 1.0, 14.0, 6.5)
+        m_hydro = st.slider("Hydration Multiplier (0.5=Hydrophobic, 1.5=Hydrophilic)", 0.4, 2.0, 1.0, 0.05)
+        if st.button("Add to Library") and m_name.strip():
+            st.session_state.molecules[m_name.strip()] = {
+                "mw": m_mw, "acid_groups": m_acid, "pKa_acid": m_pka_a,
+                "base_groups": m_base, "pKa_base": m_pka_b, "hydro_factor": m_hydro
+            }
+            st.rerun()
+
+    st.divider()
+    st.header("2. Test Environments (pH & Temp)")
+    ph_input = st.text_input("Enter pH values to test (comma-separated)", value="5.5, 7.4, 8.5")
+    temp_input = st.text_input("Enter Temperatures in °C (comma-separated)", value="25.0, 37.0, 39.5")
+    film_thickness = st.number_input("Film Thickness (mm)", 0.05, 10.0, 0.5, 0.05)
+
+# Parse pH and Temperature lists safely
+try:
+    ph_list = sorted({float(x.strip()) for x in ph_input.split(",") if x.strip()})
+except ValueError:
+    st.error("Please enter valid numbers for pH separated by commas (e.g., 5.5, 7.4, 8.5).")
+    ph_list = [7.4]
+
+try:
+    temp_list = sorted({float(x.strip()) for x in temp_input.split(",") if x.strip()})
+except ValueError:
+    st.error("Please enter valid numbers for Temperature separated by commas (e.g., 25, 37, 40).")
+    temp_list = [37.0]
+
+# --- STEP 1: DYNAMIC CONDITION BUILDER ---
+st.subheader("Step 1: Define Your Conditions (Formulations & Concentrations)")
+col_btn1, col_btn2, _ = st.columns([1.2, 1, 4])
+if col_btn1.button("➕ Add New Condition", type="primary"):
+    cid = uuid.uuid4().hex[:6]
+    idx = len(st.session_state.conditions)
+    label = f"Condition {chr(65 + idx)}" if idx < 26 else f"Condition {idx + 1}"
+    st.session_state.conditions[cid] = {
+        "name": label,
+        "components": {}
+    }
+    st.rerun()
+
+if col_btn2.button("🗑️ Clear All Conditions", disabled=not st.session_state.conditions):
+    st.session_state.conditions = {}
+    st.rerun()
+
+if not st.session_state.conditions:
+    st.info("Click **➕ Add New Condition** above to create Condition A, Condition B, etc., and choose their ingredients and concentrations.")
 else:
-    ha_data = {
-        "atoms": 141,
-        "residues": 7,
-        "carboxyls": 3,
-        "mw": 1155.9,
-        "source": "Default 6-mer GLYCAM HA Profile"
-    }
+    available_mols = list(st.session_state.molecules.keys())
+    to_delete = None
 
-# --- INTERACTIVE ENVIRONMENT SLIDERS ---
-col_s1, col_s2 = st.columns(2)
-active_ph = col_s1.slider("Active Wound Bed pH", 2.0, 12.0, float(default_ph), 0.1)
-active_temp = col_s2.slider("Active Temperature (°C)", 4.0, 60.0, float(default_temp), 0.5)
+    for cid, cond in st.session_state.conditions.items():
+        with st.container(border=True):
+            c_top1, c_top2 = st.columns([5, 1])
+            cond["name"] = c_top1.text_input("Condition Name", cond["name"], key=f"name_{cid}")
+            c_top2.write("")
+            if c_top2.button("🗑️ Remove", key=f"del_{cid}"):
+                to_delete = cid
 
-# --- BIOPHYSICAL SIMULATION ENGINE ---
+            selected_mols = st.multiselect(
+                "Select Polymers / Components",
+                options=available_mols,
+                default=[m for m in cond["components"] if m in available_mols],
+                key=f"mols_{cid}"
+            )
+
+            updated_comps = {}
+            if selected_mols:
+                conc_cols = st.columns(min(len(selected_mols), 4))
+                for i, m in enumerate(selected_mols):
+                    prev_val = cond["components"].get(m, 1.0)
+                    val = conc_cols[i % len(conc_cols)].number_input(
+                        f"{m} (% w/v)",
+                        min_value=0.01,
+                        max_value=50.0,
+                        value=float(prev_val),
+                        step=0.1,
+                        key=f"conc_{cid}_{m}"
+                    )
+                    updated_comps[m] = val
+            else:
+                st.caption("No polymers selected (acts as a Water-Only Control).")
+            cond["components"] = updated_comps
+
+    if to_delete:
+        del st.session_state.conditions[to_delete]
+        st.rerun()
+
+# --- BIOPHYSICAL SIMULATION FUNCTION ---
 def water_viscosity_mPas(T_C):
-    """Vogel-Fulcher-Tammann approximation for dynamic viscosity of water (mPa·s)."""
     T_K = T_C + 273.15
     return 0.02414 * (10.0 ** (247.8 / (T_K - 140.0)))
 
-def simulate_state(pH_arr, T_C_arr, include_ha=False):
-    """
-    Computes:
-    1. Net Electrostatic Charge (e/kDa) via temperature-corrected Henderson-Hasselbalch
-    2. Cationic Antibacterial Charge Density (e/kDa)
-    3. Swelling Index (relative water uptake driven by HA hydrophilicity + electrostatic repulsion + thermal expansion)
-    4. Relative Bacterial Penetration Risk (0 to 1 scale based on mesh loosening & thermal mobility)
-    """
+def run_simulation(components_dict, pH_arr, T_C_arr):
+    if not components_dict:
+        # Water-only control
+        T_K = T_C_arr + 273.15
+        mob_ratio = (T_K / water_viscosity_mPas(T_C_arr)) / (298.15 / water_viscosity_mPas(25.0))
+        return (
+            np.zeros_like(pH_arr, dtype=float),
+            np.zeros_like(pH_arr, dtype=float),
+            np.zeros_like(pH_arr, dtype=float),
+            np.clip(0.85 * (mob_ratio ** 0.2), 0.01, 1.0)
+        )
+
     T_K = T_C_arr + 273.15
-    # Van't Hoff temperature shift on amine pKa (d(pKa)/dT ~ -0.028 / K for primary amines)
-    pKa_chi = 6.50 - 0.028 * (T_C_arr - 25.0)
-    pKa_col_base = 10.50 - 0.025 * (T_C_arr - 25.0)
-    pKa_col_acid = 4.10 - 0.002 * (T_C_arr - 25.0)
-    pKa_ha = 3.20 - 0.002 * (T_C_arr - 25.0)
+    pos_total = np.zeros_like(pH_arr, dtype=float)
+    neg_total = np.zeros_like(pH_arr, dtype=float)
+    total_mass_gL = 0.0
+    weighted_hydro = 0.0
 
-    # Moles of chains per L
-    m_col = (conc_col * 10.0) / 8200.0
-    m_chi = (conc_chi * 10.0) / 1650.0
-    m_ha = ((conc_ha * 10.0) / ha_data["mw"]) if include_ha else 0.0
+    for mol_name, conc_wv in components_dict.items():
+        props = st.session_state.molecules[mol_name]
+        mass_gL = conc_wv * 10.0
+        moles_chains = mass_gL / props["mw"]
+        total_mass_gL += mass_gL
+        weighted_hydro += mass_gL * props["hydro_factor"]
 
-    total_mass = (conc_col + conc_chi + (conc_ha if include_ha else 0.0)) * 10.0
+        if props["acid_groups"] > 0:
+            pka_a = props["pKa_acid"] - 0.002 * (T_C_arr - 25.0)
+            f_neg = 1.0 / (1.0 + 10.0 ** (pka_a - pH_arr))
+            neg_total += moles_chains * props["acid_groups"] * f_neg
 
-    # Ionization fractions
-    f_col_neg = 1.0 / (1.0 + 10.0 ** (pKa_col_acid - pH_arr))
-    f_col_pos = 1.0 / (1.0 + 10.0 ** (pH_arr - pKa_col_base))
-    f_chi_pos = 1.0 / (1.0 + 10.0 ** (pH_arr - pKa_chi))
-    f_ha_neg = 1.0 / (1.0 + 10.0 ** (pKa_ha - pH_arr))
+        if props["base_groups"] > 0:
+            pka_b = props["pKa_base"] - 0.028 * (T_C_arr - 25.0)
+            f_pos = 1.0 / (1.0 + 10.0 ** (pH_arr - pka_b))
+            pos_total += moles_chains * props["base_groups"] * f_pos
 
-    pos_total = (m_col * 6.0 * f_col_pos) + (m_chi * 8.5 * f_chi_pos)
-    neg_total = (m_col * 6.0 * f_col_neg) + (m_ha * ha_data["carboxyls"] * f_ha_neg)
+    net_per_kda = (pos_total - neg_total) / total_mass_gL
+    cat_per_kda = pos_total / total_mass_gL
+    pec_pairing = np.minimum(pos_total, neg_total) / total_mass_gL
+    repulsion = np.abs(net_per_kda)
+    avg_hydro = weighted_hydro / total_mass_gL
 
-    net_per_kda = (pos_total - neg_total) / total_mass
-    cat_per_kda = pos_total / total_mass
-
-    # Swelling & Mesh Loosening Model:
-    # Base hydrophilicity increases with HA fraction; ionic repulsion (|net_charge|) expands network;
-    # PEC ionic pairing (min(pos, neg)) tightens network; temperature increases chain mobility.
-    pec_pairing = np.minimum(pos_total, neg_total) / total_mass
-    electrostatic_repulsion = np.abs(net_per_kda)
-    ha_hydration_boost = 1.45 if include_ha else 1.0
+    # Higher total polymer concentration tightens network; higher hydrophilicity & repulsion increase swelling
+    conc_tightening = 3.0 / max(total_mass_gL / 10.0, 0.2)
     thermal_factor = (T_K / 298.15) ** 1.5
 
-    swelling_ratio = (
-        120.0
-        * ha_hydration_boost
-        * (1.0 + 1.8 * electrostatic_repulsion - 1.2 * pec_pairing)
+    swelling_pct = (
+        100.0
+        * avg_hydro
+        * (conc_tightening ** 0.35)
+        * (1.0 + 1.8 * repulsion - 1.2 * pec_pairing)
         * thermal_factor
     )
 
-    # Stokes-Einstein thermal mobility factor (T / viscosity) normalized to 25 C
     mob_ratio = (T_K / water_viscosity_mPas(T_C_arr)) / (298.15 / water_viscosity_mPas(25.0))
-    # Barrier permeability proxy (higher swelling + higher thermal mobility + lower cationic killing = higher passage risk)
-    passage_index = np.clip(
-        (swelling_ratio / 350.0) * (mob_ratio ** 0.4) * (1.0 / (1.0 + 0.8 * cat_per_kda)) / (film_thickness / 0.5),
+    passage_risk = np.clip(
+        (swelling_pct / 350.0) * (mob_ratio ** 0.4) * (1.0 / (1.0 + 0.8 * cat_per_kda)) / (film_thickness / 0.5),
         0.01,
         1.0
     )
 
-    return net_per_kda, cat_per_kda, swelling_ratio, passage_index
+    return net_per_kda, cat_per_kda, swelling_pct, passage_risk
 
-# Point evaluation for active sliders
-nA, cA, swA, pA = simulate_state(np.array([active_ph]), np.array([active_temp]), include_ha=False)
-nB, cB, swB, pB = simulate_state(np.array([active_ph]), np.array([active_temp]), include_ha=True)
+# --- STEP 2: RUN & VISUALIZE ---
+st.divider()
+st.subheader("Step 2: Run Simulation & Compare Conditions")
 
-# --- TOP KPI METRICS ---
-st.subheader(f"Snapshot at pH {active_ph:.1f} & {active_temp:.1f} °C")
-k1, k2, k3, k4 = st.columns(4)
-k1.metric(
-    "Formulation A Net Charge",
-    f"{nA[0]:+.3f} e/kDa",
-    f"Cationic: {cA[0]:.3f} e/kDa"
-)
-k2.metric(
-    "Formulation B (+HA) Net Charge",
-    f"{nB[0]:+.3f} e/kDa",
-    f"{nB[0] - nA[0]:+.3f} vs Control"
-)
-k3.metric(
-    "Predicted Swelling (B vs A)",
-    f"{swB[0]:.0f}% vs {swA[0]:.0f}%",
-    f"{swB[0] - swA[0]:+.0f}% water uptake"
-)
-k4.metric(
-    "S. epidermidis Passage Risk (B vs A)",
-    f"{pB[0]*100:.1f}% vs {pA[0]*100:.1f}%",
-    f"{(pB[0] - pA[0])*100:+.1f}% change",
-    delta_color="inverse"
-)
+if st.session_state.conditions and ph_list and temp_list:
+    if st.button("▶ Run Dynamic Simulation", type="primary"):
+        st.session_state.has_run = True
 
-# --- TABS FOR DETAILED SWEEPS ---
-tab_ph, tab_temp, tab_2d, tab_data = st.tabs([
-    "🧪 1. pH Sweep (Wound Stages)",
-    "🔥 2. Temperature Sweep (Thermal Kinetics)",
-    "🗺️ 3. Combined 2D pH × Temp Heatmap",
-    "📥 4. Export Data & Summary Table"
-])
+    if st.session_state.get("has_run"):
+        # Build full results table for every Condition x pH x Temperature combination
+        records = []
+        for cid, cond in st.session_state.conditions.items():
+            comp_str = " + ".join(f"{m} ({c:g}%)" for m, c in cond["components"].items()) or "Water Only"
+            for t_val in temp_list:
+                for ph_val in ph_list:
+                    net_q, cat_q, swell, pass_r = run_simulation(
+                        cond["components"], np.array([ph_val]), np.array([t_val])
+                    )
+                    records.append({
+                        "Condition": cond["name"],
+                        "Composition": comp_str,
+                        "pH": ph_val,
+                        "Temperature (°C)": t_val,
+                        "Net Charge (e/kDa)": round(float(net_q[0]), 4),
+                        "Cationic Antibacterial Charge (e/kDa)": round(float(cat_q[0]), 4),
+                        "Predicted Swelling (%)": round(float(swell[0]), 1),
+                        "Bacterial Passage Risk (%)": round(float(pass_r[0] * 100), 1),
+                    })
 
-# === TAB 1: pH SWEEP ===
-with tab_ph:
-    st.markdown(f"#### Effect of Wound pH at Constant Temperature ({active_temp:.1f} °C)")
-    ph_grid = np.linspace(3.0, 11.0, 161)
-    t_const = np.full_like(ph_grid, active_temp)
+        df_res = pd.DataFrame(records)
 
-    netA_ph, catA_ph, swA_ph, passA_ph = simulate_state(ph_grid, t_const, include_ha=False)
-    netB_ph, catB_ph, swB_ph, passB_ph = simulate_state(ph_grid, t_const, include_ha=True)
+        tab1, tab2, tab3 = st.tabs([
+            "📊 Condition Comparison Charts",
+            "📈 Continuous pH & Temp Curves",
+            "📥 Full Results Table & Export"
+        ])
 
-    c1, c2 = st.columns(2)
-    with c1:
-        fig_charge = go.Figure()
-        fig_charge.add_trace(go.Scatter(x=ph_grid, y=netA_ph, name="Formulation A (Control)", line=dict(color="#0072B2", width=3)))
-        fig_charge.add_trace(go.Scatter(x=ph_grid, y=netB_ph, name="Formulation B (+ HA)", line=dict(color="#D55E00", width=3)))
-        fig_charge.add_hline(y=0, line_dash="dot", line_color="gray")
-        for label, ph_mark, col in [("Healthy (5.5)", 5.5, "#009E73"), ("PBS (7.4)", 7.4, "#56B4E9"), ("Infected (8.5)", 8.5, "#CC79A7")]:
-            fig_charge.add_vline(x=ph_mark, line_dash="dash", line_color=col, annotation_text=label)
-        fig_charge.update_layout(title="Net Electrostatic Charge vs. pH", xaxis_title="pH", yaxis_title="Net Charge (e / kDa)")
-        st.plotly_chart(fig_charge, use_container_width=True)
+        with tab1:
+            sel_temp = st.selectbox("Select Temperature (°C) to compare across your pH points:", temp_list)
+            df_sub = df_res[df_res["Temperature (°C)"] == sel_temp].copy()
+            df_sub["pH Label"] = "pH " + df_sub["pH"].astype(str)
 
-    with c2:
-        fig_swell = go.Figure()
-        fig_swell.add_trace(go.Scatter(x=ph_grid, y=swA_ph, name="Formulation A (Control)", line=dict(color="#0072B2", width=3)))
-        fig_swell.add_trace(go.Scatter(x=ph_grid, y=swB_ph, name="Formulation B (+ HA)", line=dict(color="#D55E00", width=3)))
-        fig_swell.add_vline(x=active_ph, line_dash="solid", line_color="black", annotation_text="Selected pH")
-        fig_swell.update_layout(title="Predicted Water Swelling (%) vs. pH", xaxis_title="pH", yaxis_title="Equilibrium Swelling (%)")
-        st.plotly_chart(fig_swell, use_container_width=True)
+            c1, c2 = st.columns(2)
+            with c1:
+                fig1 = px.bar(
+                    df_sub, x="pH Label", y="Predicted Swelling (%)", color="Condition",
+                    barmode="group", title=f"Swelling (%) by Condition at {sel_temp} °C"
+                )
+                st.plotly_chart(fig1, use_container_width=True)
+            with c2:
+                fig2 = px.bar(
+                    df_sub, x="pH Label", y="Bacterial Passage Risk (%)", color="Condition",
+                    barmode="group", title=f"Bacterial Passage Risk (%) at {sel_temp} °C"
+                )
+                st.plotly_chart(fig2, use_container_width=True)
 
-# === TAB 2: TEMPERATURE SWEEP ===
-with tab_temp:
-    st.markdown(f"#### Effect of Temperature at Constant pH ({active_ph:.1f})")
-    st.caption("Accounts for Van't Hoff pKa shift of Chitosan amines, water viscosity drop, and thermal polymer expansion.")
-    temp_grid = np.linspace(4.0, 50.0, 120)
-    ph_const = np.full_like(temp_grid, active_ph)
+            c3, c4 = st.columns(2)
+            with c3:
+                fig3 = px.bar(
+                    df_sub, x="pH Label", y="Net Charge (e/kDa)", color="Condition",
+                    barmode="group", title=f"Net Electrostatic Charge (e/kDa) at {sel_temp} °C"
+                )
+                fig3.add_hline(y=0, line_dash="dot", line_color="gray")
+                st.plotly_chart(fig3, use_container_width=True)
+            with c4:
+                fig4 = px.bar(
+                    df_sub, x="pH Label", y="Cationic Antibacterial Charge (e/kDa)", color="Condition",
+                    barmode="group", title=f"Antibacterial Cationic Charge at {sel_temp} °C"
+                )
+                st.plotly_chart(fig4, use_container_width=True)
 
-    netA_t, catA_t, swA_t, passA_t = simulate_state(ph_const, temp_grid, include_ha=False)
-    netB_t, catB_t, swB_t, passB_t = simulate_state(ph_const, temp_grid, include_ha=True)
+        with tab2:
+            col_c1, col_c2 = st.columns(2)
+            ref_temp = col_c1.selectbox("Fix Temperature for pH Curve (°C):", temp_list, key="curve_t")
+            ref_ph = col_c2.selectbox("Fix pH for Temperature Curve:", ph_list, key="curve_ph")
 
-    c1, c2 = st.columns(2)
-    with c1:
-        fig_t_cat = go.Figure()
-        fig_t_cat.add_trace(go.Scatter(x=temp_grid, y=catA_t, name="Formulation A (Control)", line=dict(color="#0072B2", width=3)))
-        fig_t_cat.add_trace(go.Scatter(x=temp_grid, y=catB_t, name="Formulation B (+ HA)", line=dict(color="#D55E00", width=3)))
-        for label, t_mark, col in [("Room (25°C)", 25.0, "#7F8C8D"), ("Body (37°C)", 37.0, "#009E73"), ("Fever/Inflamed (39.5°C)", 39.5, "#E74C3C")]:
-            fig_t_cat.add_vline(x=t_mark, line_dash="dash", line_color=col, annotation_text=label)
-        fig_t_cat.update_layout(title="Antibacterial Cationic Charge vs. Temperature", xaxis_title="Temperature (°C)", yaxis_title="Positive Charge (e / kDa)")
-        st.plotly_chart(fig_t_cat, use_container_width=True)
+            ph_sweep = np.linspace(min(ph_list) - 1.5, max(ph_list) + 1.5, 120)
+            ph_sweep = np.clip(ph_sweep, 2.0, 12.0)
+            t_sweep = np.linspace(max(4.0, min(temp_list) - 10.0), min(60.0, max(temp_list) + 10.0), 120)
 
-    with c2:
-        fig_t_pass = go.Figure()
-        fig_t_pass.add_trace(go.Scatter(x=temp_grid, y=passA_t * 100, name="Formulation A (Control)", line=dict(color="#0072B2", width=3)))
-        fig_t_pass.add_trace(go.Scatter(x=temp_grid, y=passB_t * 100, name="Formulation B (+ HA)", line=dict(color="#D55E00", width=3)))
-        fig_t_pass.add_vline(x=active_temp, line_dash="solid", line_color="black", annotation_text="Selected Temp")
-        fig_t_pass.update_layout(title="S. epidermidis Penetration Risk (%) vs. Temperature", xaxis_title="Temperature (°C)", yaxis_title="Relative Passage Index (%)")
-        st.plotly_chart(fig_t_pass, use_container_width=True)
+            fig_ph_c = go.Figure()
+            fig_t_c = go.Figure()
 
-# === TAB 3: 2D COMBINED HEATMAP ===
-with tab_2d:
-    st.markdown("#### Combined pH × Temperature Landscape for Formulation B (HA Treatment)")
-    ph_2d = np.linspace(4.5, 9.5, 50)
-    t_2d = np.linspace(20.0, 45.0, 50)
-    PH_M, T_M = np.meshgrid(ph_2d, t_2d)
+            for cid, cond in st.session_state.conditions.items():
+                _, _, sw_p, _ = run_simulation(cond["components"], ph_sweep, np.full_like(ph_sweep, ref_temp))
+                _, _, _, pa_t = run_simulation(cond["components"], np.full_like(t_sweep, ref_ph), t_sweep)
+                fig_ph_c.add_trace(go.Scatter(x=ph_sweep, y=sw_p, name=cond["name"], mode="lines", line=dict(width=3)))
+                fig_t_c.add_trace(go.Scatter(x=t_sweep, y=pa_t * 100, name=cond["name"], mode="lines", line=dict(width=3)))
 
-    _, _, SW_M, PASS_M = simulate_state(PH_M, T_M, include_ha=True)
+            for p_pt in ph_list:
+                fig_ph_c.add_vline(x=p_pt, line_dash="dash", line_color="gray")
+            for t_pt in temp_list:
+                fig_t_c.add_vline(x=t_pt, line_dash="dash", line_color="gray")
 
-    c1, c2 = st.columns(2)
-    with c1:
-        fig_hm1 = px.imshow(
-            SW_M, x=np.round(ph_2d, 2), y=np.round(t_2d, 1),
-            origin="lower", aspect="auto", color_continuous_scale="YlGnBu",
-            labels=dict(x="Wound pH", y="Temperature (°C)", color="Swelling %"),
-            title="Formulation B Swelling Landscape (%)"
-        )
-        st.plotly_chart(fig_hm1, use_container_width=True)
+            fig_ph_c.update_layout(title=f"Swelling vs. pH (at {ref_temp} °C)", xaxis_title="pH", yaxis_title="Swelling (%)")
+            fig_t_c.update_layout(title=f"Bacterial Passage Risk vs. Temp (at pH {ref_ph})", xaxis_title="Temperature (°C)", yaxis_title="Passage Risk (%)")
 
-    with c2:
-        fig_hm2 = px.imshow(
-            PASS_M * 100, x=np.round(ph_2d, 2), y=np.round(t_2d, 1),
-            origin="lower", aspect="auto", color_continuous_scale="OrRd",
-            labels=dict(x="Wound pH", y="Temperature (°C)", color="Passage %"),
-            title="Formulation B Bacterial Penetration Risk (%)"
-        )
-        st.plotly_chart(fig_hm2, use_container_width=True)
+            g1, g2 = st.columns(2)
+            g1.plotly_chart(fig_ph_c, use_container_width=True)
+            g2.plotly_chart(fig_t_c, use_container_width=True)
 
-# === TAB 4: EXPORT DATA TABLE ===
-with tab_data:
-    st.markdown("#### Clinical Benchmark Comparison Table")
-    scenarios = [
-        ("Healthy / Healing Skin", 5.5, 36.5),
-        ("Physiological / PBS Buffer", 7.4, 37.0),
-        ("Infected Chronic Wound", 8.5, 39.5),
-        ("Room Temperature Prep", 7.0, 25.0),
-        ("Custom Active Setting", active_ph, active_temp),
-    ]
-    rows = []
-    for name, ph_v, t_v in scenarios:
-        na, ca, swa, pa = simulate_state(np.array([ph_v]), np.array([t_v]), include_ha=False)
-        nb, cb, swb, pb = simulate_state(np.array([ph_v]), np.array([t_v]), include_ha=True)
-        rows.append({
-            "Scenario": name,
-            "pH": ph_v,
-            "Temp (°C)": t_v,
-            "Form A Net Charge (e/kDa)": round(float(na[0]), 4),
-            "Form B (+HA) Net Charge (e/kDa)": round(float(nb[0]), 4),
-            "Form A Swelling (%)": round(float(swa[0]), 1),
-            "Form B (+HA) Swelling (%)": round(float(swb[0]), 1),
-            "Form A Passage Risk (%)": round(float(pa[0] * 100), 1),
-            "Form B (+HA) Passage Risk (%)": round(float(pb[0] * 100), 1),
-        })
-
-    df_summary = pd.DataFrame(rows)
-    st.dataframe(df_summary, hide_index=True, use_container_width=True)
-    st.download_button(
-        "⬇️ Download pH & Temperature Simulation Table (CSV)",
-        data=df_summary.to_csv(index=False).encode("utf-8"),
-        file_name="WoundEnv_Sim_pH_Temp_Results.csv",
-        mime="text/csv",
-        type="primary"
-    )
+        with tab3:
+            st.dataframe(df_res, hide_index=True, use_container_width=True)
+            st.download_button(
+                "⬇️ Download Complete Simulation Results (CSV)",
+                data=df_res.to_csv(index=False).encode("utf-8"),
+                file_name="WoundEnv_Dynamic_Results.csv",
+                mime="text/csv",
+                type="primary"
+            )
+else:
+    st.warning("Add at least one Condition above and specify valid pH and Temperature lists in the sidebar to run.")
